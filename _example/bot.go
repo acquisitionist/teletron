@@ -79,15 +79,6 @@ func (b *updater) handleName(update *teletron.Update) stateFn {
 }
 
 func (b *updater) handleUpdateTypes(update *teletron.Update) stateFn {
-	if update == nil {
-		b.app.logger.Warn(
-			"Nil Update",
-			"update.id", update.UpdateId,
-			"chat.id", b.chatID,
-		)
-		return b.handleUpdateTypes
-	}
-
 	switch update.GetType() {
 	case teletron.UpdateTypeMessage:
 		return b.handleMessage(update)

@@ -15,9 +15,8 @@ import (
 )
 
 var (
-	ErrDispatcherClosed        = errors.New("teletron: Dispatcher closed")
-	ErrDispatcherNilTokenInput = errors.New("teletron: nil input provided as token")
-	ErrDispatcherNilBotInput   = errors.New("teletron: nil input provided as NewBotFn")
+	ErrDispatcherClosed          = errors.New("teletron: Dispatcher closed")
+	ErrDispatcherNilUpdaterInput = errors.New("teletron: Nil input provided as NewUpdaterFn")
 )
 
 type Updater interface {
@@ -120,14 +119,18 @@ func (d *Dispatcher) Poll(b *Bot, opts *PollingOpts) error {
 		return ErrDispatcherClosed
 	}
 
+	if d.Concurrent <= 0 {
+		d.Concurrent = runtime.GOMAXPROCS(0)
+	}
+
+	if d.NewUpdater == nil {
+		return ErrDispatcherNilUpdaterInput
+	}
+
 	d.current.updateChan = make(chan *Update, 100)
 	d.current.sem = make(chan struct{}, d.Concurrent)
 
 	if opts != nil {
-		if d.Concurrent <= 0 {
-			d.Concurrent = runtime.GOMAXPROCS(0)
-		}
-
 		if opts.EnableWebhookDeletion || opts.DropPendingUpdates {
 			// For polling to work, we want to make sure we don't have an existing webhook.
 			// Extra perk - we can also use this to drop pending updates!
@@ -148,9 +151,7 @@ func (d *Dispatcher) Poll(b *Bot, opts *PollingOpts) error {
 	})
 
 	for upd := range d.current.updateChan {
-		// acquire slot
 		d.current.sem <- struct{}{}
-		// spawn
 		d.wg.Go(func() {
 			defer func() {
 				if pv := recover(); pv != nil {
@@ -159,7 +160,6 @@ func (d *Dispatcher) Poll(b *Bot, opts *PollingOpts) error {
 						"panic recovered in worker: \n%v\nSTACK TRACE:\n%s", pv, stack,
 					)
 				}
-				// release slot
 				<-d.current.sem
 			}()
 			err := d.processUpdate(upd)
@@ -172,7 +172,7 @@ func (d *Dispatcher) Poll(b *Bot, opts *PollingOpts) error {
 			}
 		})
 	}
-	// Drain semaphore to wait for all workers to finish
+
 	for n := d.Concurrent; n > 0; n-- {
 		d.current.sem <- struct{}{}
 	}
@@ -227,32 +227,30 @@ func (d *Dispatcher) pollingLoop(ctx context.Context, opts *GetUpdatesOpts) {
 }
 
 func (d *Dispatcher) getSession(chatID int64) (*session, error) {
-	candidate := &session{
+	if actual, ok := d.current.sessions.Load(chatID); ok {
+		s, ok := actual.(*session)
+		if !ok {
+			return nil, fmt.Errorf("invalid session type for chat %d: %T", chatID, actual)
+		}
+		return s, nil
+	}
+
+	s := &session{
 		bot:     d.NewUpdater(chatID),
 		limiter: d.Limiter,
 	}
 
-	actual, loaded := d.current.sessions.LoadOrStore(chatID, candidate)
-
-	s, ok := actual.(*session)
-	if !ok {
-		return nil, fmt.Errorf("session for chat %d is of invalid type", chatID)
-	}
-
-	if !loaded {
-		log.Printf("created new bot session: chat_id=%d", chatID)
-	}
-
+	d.current.sessions.Store(chatID, s)
 	return s, nil
 }
 
 func (d *Dispatcher) Shutdown(ctx context.Context) error {
 	d.inShutdown.Store(true)
-	// Cancel the polling loop so no more updates are sent
+
 	if d.current.cancel != nil {
 		d.current.cancel()
 	}
-	// Run shutdown callbacks concurrently
+
 	d.mu.Lock()
 	for _, f := range d.onShutdown {
 		go f()
@@ -261,10 +259,8 @@ func (d *Dispatcher) Shutdown(ctx context.Context) error {
 
 	done := make(chan struct{})
 	go func() {
-		// Wait for all goroutines to finish
 		d.wg.Wait()
 
-		// Safe to close the update channel now
 		if d.current.updateChan != nil {
 			close(d.current.updateChan)
 		}
@@ -272,7 +268,6 @@ func (d *Dispatcher) Shutdown(ctx context.Context) error {
 		close(done)
 	}()
 
-	// Wait for either context deadline or WaitGroup completion
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
